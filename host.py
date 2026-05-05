@@ -14,6 +14,8 @@ class HostController:
         
         self.mouse_listener = None
         self.frozen_pos = None
+        self.vx = 0.5
+        self.vy = 0.5
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -69,7 +71,11 @@ class HostController:
         
         if target_ip:
             print(f"[*] Switching to CLIENT mode (Mouse Frozen)")
-            self.frozen_pos = self.mouse_controller.position
+            import ctypes
+            user32 = ctypes.windll.user32
+            cx, cy = user32.GetSystemMetrics(0) // 2, user32.GetSystemMetrics(1) // 2
+            user32.SetCursorPos(cx, cy) # Center before suppressing
+            self.vx, self.vy = 0.5, 0.5 # Reset virtual cursor
             self.start_listener(suppress=True)
         else:
             print("[*] Switching to HOST mode (Mouse Normal)")
@@ -231,16 +237,32 @@ class HostController:
                 print(f"[Control] Failed to send to {ip}: {e}")
 
     def on_move(self, x, y):
-        if self.active_client_ip and self.frozen_pos:
-            # Calculate raw delta from the frozen position
-            dx = x - self.frozen_pos[0]
-            dy = y - self.frozen_pos[1]
+        if self.active_client_ip:
+            import ctypes
+            user32 = ctypes.windll.user32
+            sw = user32.GetSystemMetrics(0)
+            sh = user32.GetSystemMetrics(1)
+            cx, cy = sw // 2, sh // 2
+            
+            dx = x - cx
+            dy = y - cy
             
             if dx != 0 or dy != 0:
-                # Add sensitivity here (e.g. 1.5)
+                # Update Virtual Cursor
                 sensitivity = 1.5
-                data = network_utils.pack_move(dx * sensitivity, dy * sensitivity)
+                self.vx += (dx / sw) * sensitivity
+                self.vy += (dy / sh) * sensitivity
+                
+                # Clamp to 0.0 - 1.0
+                self.vx = max(0.0, min(1.0, self.vx))
+                self.vy = max(0.0, min(1.0, self.vy))
+                
+                # Send Absolute Virtual Position to Client
+                data = network_utils.pack_move(self.vx, self.vy)
                 self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
+                
+                # Reset the internal cursor so it never hits the edge of the screen
+                user32.SetCursorPos(cx, cy)
 
     def on_click(self, x, y, button, pressed):
         if self.active_client_ip:
