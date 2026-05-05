@@ -24,6 +24,11 @@ SCROLL_FMT = '!Bii'
 # Gaze Packet: is_looking(1 byte)
 GAZE_FMT = '!B'
 
+# Control Packet: type(1 byte), cmd_id(1 byte)
+# type 4 = control
+# cmd_id: 1 = Start Calibration
+CONTROL_FMT = '!BB'
+
 def pack_move(x, y):
     return struct.pack(MOVE_FMT, 1, float(x), float(y))
 
@@ -51,3 +56,10 @@ def pack_gaze(is_looking):
 def unpack_gaze(data):
     is_looking = struct.unpack(GAZE_FMT, data)[0]
     return bool(is_looking)
+
+def pack_control(cmd_id):
+    return struct.pack(CONTROL_FMT, 4, int(cmd_id))
+
+def unpack_control(data):
+    _, cmd_id = struct.unpack(CONTROL_FMT, data)
+    return cmd_id

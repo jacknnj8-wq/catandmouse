@@ -8,9 +8,12 @@ import network_utils
 from gaze_tracker import GazeTracker
 
 class ClientController:
-    def __init__(self, host_ip):
+    def __init__(self, host_ip, camera_source=0):
         self.host_ip = host_ip
+        self.camera_source = camera_source
         self.mouse_controller = mouse.Controller()
+        self.should_calibrate = False
+        self.tracker = None
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,24 +99,56 @@ class ClientController:
                 elif packet_type == 3:
                     dx, dy = network_utils.unpack_scroll(data[:9])
                     self.mouse_controller.scroll(dx, dy)
+                elif packet_type == 4:
+                    cmd_id = network_utils.unpack_control(data[:2])
+                    if cmd_id == 1:
+                        print("[Control] Received calibration command from Host")
+                        self.should_calibrate = True
             except Exception as e:
                 print(f"[TCP] Error: {e}")
                 break
 
     def run_vision(self):
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("[Vision] Error: Could not open camera.")
+        print(f"[Vision] Initializing camera source: {self.camera_source}...")
+        
+        source = self.camera_source
+        if isinstance(source, str) and source.isdigit():
+            source = int(source)
+            
+        cap = None
+        if isinstance(source, int):
+            print(f"[Vision] Using local camera index {source} with DSHOW")
+            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        else:
+            # It's a URL. Try FFMPEG first as it's usually better for network streams
+            print(f"[Vision] Attempting to open URL {source} with FFMPEG...")
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            
+            if not cap.isOpened():
+                print(f"[Vision] FFMPEG failed, trying default backend...")
+                cap = cv2.VideoCapture(source)
+
+        if not cap or not cap.isOpened():
+            print(f"[Vision] Error: Could not open camera source: {source}")
+            print("[Vision] Troubleshooting tips:")
+            print("1. Make sure DroidCam is running on your phone.")
+            print(f"2. Try running: python test_connection.py {source.rsplit('/', 1)[0] if isinstance(source, str) else ''}")
             return
 
-        tracker = GazeTracker()
+        self.tracker = GazeTracker()
         
-        print("Please look directly at the camera for calibration.")
+        print("Waiting for Host to start calibration (Press 'C' on Host)...")
         
         last_gaze_state = None
         consecutive_failures = 0
         
         while cap.isOpened():
+            if self.should_calibrate:
+                print("[Vision] Starting calibration...")
+                self.tracker.is_calibrated = False
+                self.tracker.calibration_samples = []
+                self.should_calibrate = False
+
             success, frame = cap.read()
             if not success:
                 consecutive_failures += 1
@@ -124,7 +159,10 @@ class ClientController:
             
             consecutive_failures = 0
 
-            annotated_image, is_looking, angles = tracker.process_frame(frame)
+            annotated_image, is_looking, angles = self.tracker.process_frame(frame)
+            
+            if not self.tracker.is_calibrated:
+                cv2.putText(annotated_image, "CALIBRATING CLIENT...", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             
             # Send state if it changed, or periodically
             if is_looking != last_gaze_state:
@@ -150,8 +188,15 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python client.py <HOST_IP>")
+        print("Usage: python client.py <HOST_IP> [CAMERA_SOURCE]")
+        print("Examples:")
+        print("  python client.py 192.168.1.10")
+        print("  python client.py 192.168.1.10 1")
+        print("  python client.py 192.168.1.10 http://192.168.1.9:4747/video")
         sys.exit(1)
         
-    client = ClientController(sys.argv[1])
+    host_ip = sys.argv[1]
+    camera_source = sys.argv[2] if len(sys.argv) > 2 else 0
+    
+    client = ClientController(host_ip, camera_source)
     client.start()

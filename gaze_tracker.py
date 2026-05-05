@@ -132,16 +132,39 @@ class GazeTracker:
         return (pitch, yaw, roll), nose_2d
 
 if __name__ == "__main__":
-    import os
-    cap = cv2.VideoCapture(0)
+    import sys
+    
+    source = 0
+    if len(sys.argv) > 1:
+        source = sys.argv[1]
+        if source.isdigit():
+            source = int(source)
+    
+    cap = None
+    if isinstance(source, int):
+        print(f"Using local camera index {source} with DSHOW")
+        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+    else:
+        print(f"Attempting to open URL {source} with FFMPEG...")
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            print("FFMPEG failed, trying default backend...")
+            cap = cv2.VideoCapture(source)
+        
+    if not cap or not cap.isOpened():
+        print(f"Error: Could not open camera source: {source}")
+        sys.exit(1)
+        
     tracker = GazeTracker()
     
+    print(f"Tracking using source: {source}")
     print("Please look directly at the camera for calibration.")
     
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
-            continue
+            print("Failed to grab frame.")
+            break
 
         annotated_image, is_looking, angles = tracker.process_frame(frame)
         
