@@ -32,22 +32,24 @@ class ClientController:
         # Connect TCP for clicks
         while True:
             try:
+                print(f"Attempting TCP connection to {self.host_ip}:{network_utils.TCP_PORT}...")
                 self.tcp_sock.connect((self.host_ip, network_utils.TCP_PORT))
                 print("[TCP] Connected for clicks.")
                 break
             except Exception as e:
-                print("Retrying TCP connection...")
-                time.sleep(1)
+                print(f"[TCP] Connection failed: {e}. Retrying in 2s...")
+                time.sleep(2)
 
         # Connect TCP for gaze
         while True:
             try:
+                print(f"Attempting Gaze connection to {self.host_ip}:{network_utils.GAZE_PORT}...")
                 self.gaze_sock.connect((self.host_ip, network_utils.GAZE_PORT))
                 print("[Gaze] Connected to send gaze data.")
                 break
             except Exception as e:
-                print("Retrying Gaze connection...")
-                time.sleep(1)
+                print(f"[Gaze] Connection failed: {e}. Retrying in 2s...")
+                time.sleep(2)
 
         # Start listening threads
         threading.Thread(target=self.listen_udp, daemon=True).start()

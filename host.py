@@ -18,14 +18,24 @@ class HostController:
         # TCP Server for Clicks/Commands
         self.tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp_server.bind(('0.0.0.0', network_utils.TCP_PORT))
-        self.tcp_server.listen(5)
+        try:
+            self.tcp_server.bind(('0.0.0.0', network_utils.TCP_PORT))
+            self.tcp_server.listen(5)
+            print(f"[Server] TCP Click/Command server listening on port {network_utils.TCP_PORT}")
+        except Exception as e:
+            print(f"[ERROR] Failed to bind TCP Click/Command server: {e}")
+            raise
         
         # TCP Server for Gaze State
         self.gaze_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.gaze_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.gaze_server.bind(('0.0.0.0', network_utils.GAZE_PORT))
-        self.gaze_server.listen(5)
+        try:
+            self.gaze_server.bind(('0.0.0.0', network_utils.GAZE_PORT))
+            self.gaze_server.listen(5)
+            print(f"[Server] Gaze state server listening on port {network_utils.GAZE_PORT}")
+        except Exception as e:
+            print(f"[ERROR] Failed to bind Gaze state server: {e}")
+            raise
 +
         self.client_tcp_sockets = {} # IP -> socket
 
