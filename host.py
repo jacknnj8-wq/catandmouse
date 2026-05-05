@@ -11,6 +11,7 @@ class HostController:
         self.camera_source = camera_source
         self.active_client_ip = None
         self.gaze_states = {"host": False} # ip -> bool
+        self.is_ignoring_move = False
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -36,7 +37,7 @@ class HostController:
         except Exception as e:
             print(f"[ERROR] Failed to bind Gaze state server: {e}")
             raise
-+
+
         self.client_tcp_sockets = {} # IP -> socket
 
         # Mouse tracking for deltas
@@ -55,6 +56,30 @@ class HostController:
         threading.Thread(target=self.run_vision, daemon=True).start()
         
         # Start Mouse Listener
+        from pynput import keyboard
+        
+        def on_press(key):
+            try:
+                if key == keyboard.Key.tab:
+                    # Toggle focus manually for testing
+                    if self.active_client_ip:
+                        print("[Manual] Switching focus back to HOST")
+                        self.active_client_ip = None
+                    elif self.client_tcp_sockets:
+                        first_client = list(self.client_tcp_sockets.keys())[0]
+                        print(f"[Manual] Force switching focus to CLIENT: {first_client}")
+                        self.is_ignoring_move = True
+                        self.mouse_controller.position = (500, 500)
+                        self.active_client_ip = first_client
+                    else:
+                        print("[Manual] No clients connected to switch to!")
+            except AttributeError:
+                pass
+
+        # Start keyboard listener in background
+        k_listener = keyboard.Listener(on_press=on_press)
+        k_listener.start()
+
         with mouse.Listener(
                 on_move=self.on_move,
                 on_click=self.on_click,
@@ -94,18 +119,25 @@ class HostController:
         # Priority 1: Host
         if self.gaze_states.get("host"):
             if self.active_client_ip is not None:
-                print("[*] Focus returned to Host")
+                print("[*] Focus returned to Host (Local Camera detected focus)")
                 self.active_client_ip = None
             return
 
         # Priority 2: Clients
+        found_active_client = False
         for ip, is_looking in self.gaze_states.items():
             if ip == "host": continue
             if is_looking:
+                found_active_client = True
                 if self.active_client_ip != ip:
                     print(f"[*] Focus switched to client {ip}")
                     self.active_client_ip = ip
-                return
+                break
+        
+        if not found_active_client and self.active_client_ip is not None:
+            # If no one is looking at any screen, we can either keep focus or clear it.
+            # Keeping it for now to avoid flickering.
+            pass
         
         # If no one is looking, keep current or clear?
         # Let's clear focus if no one is looking for simplicity
@@ -181,24 +213,29 @@ class HostController:
                 print(f"[Control] Failed to send to {ip}: {e}")
 
     def on_move(self, x, y):
-        if self.last_pos is None:
-            self.last_pos = (x, y)
+        if self.is_ignoring_move:
+            self.is_ignoring_move = False
             return
 
-        dx = x - self.last_pos[0]
-        dy = y - self.last_pos[1]
-        self.last_pos = (x, y)
+        if self.active_client_ip:
+            # Use a fixed center point to calculate relative movement
+            center_x, center_y = 500, 500
+            dx = x - center_x
+            dy = y - center_y
 
-        if self.active_client_ip and (dx != 0 or dy != 0):
-            # Send via UDP
-            data = network_utils.pack_move(dx, dy)
-            self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
-            
-            # Lock mouse to center of screen to prevent it from wandering off on the host
-            # For prototype, we'll just snap it back if we move too far, or just continuously
-            # Wait, moving the mouse programmatically will trigger on_move again! 
-            # To avoid infinite loops, we would need to ignore programmatic moves.
-            # For this simple prototype, we won't lock the mouse. We'll just let it move.
+            if dx != 0 or dy != 0:
+                # Sensitivity adjustment (increase to slow down, decrease to speed up)
+                sensitivity = 1.0
+                
+                # Send movement to client
+                data = network_utils.pack_move(dx / sensitivity, dy / sensitivity)
+                self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
+                
+                # Snap mouse back to center to allow infinite movement
+                self.is_ignoring_move = True
+                self.mouse_controller.position = (center_x, center_y)
+        else:
+            self.last_pos = (x, y)
 
     def on_click(self, x, y, button, pressed):
         if self.active_client_ip:

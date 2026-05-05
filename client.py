@@ -68,8 +68,10 @@ class ClientController:
                 # The first byte is the packet type
                 packet_type = struct.unpack('!B', data[:1])[0]
                 if packet_type == 1:
+                    import pyautogui
                     dx, dy = network_utils.unpack_move(data)
-                    self.mouse_controller.move(dx, dy)
+                    # print(f"[UDP] Move: {dx}, {dy}") # Debug
+                    pyautogui.moveRel(dx, dy, _pause=False)
             except Exception as e:
                 print(f"[UDP] Error: {e}")
 
