@@ -1,9 +1,9 @@
 import struct
 
 # Ports
-UDP_PORT = 29485    # For mouse movement (fast, unreliable)
-TCP_PORT = 29486    # For clicks, keys, and control (slow, reliable)
-GAZE_PORT = 29487   # For client sending gaze status to host
+UDP_PORT = 8080    # For mouse movement
+TCP_PORT = 8081    # For clicks, keys, and control
+GAZE_PORT = 8082   # For client sending gaze status to host
 
 # Packet Structures
 # We use struct to pack data efficiently
