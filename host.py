@@ -224,11 +224,11 @@ class HostController:
             dy = y - center_y
 
             if dx != 0 or dy != 0:
-                # Sensitivity adjustment (increase to slow down, decrease to speed up)
+                # Sensitivity adjustment (1.0 = normal)
                 sensitivity = 1.0
                 
                 # Send movement to client
-                data = network_utils.pack_move(dx / sensitivity, dy / sensitivity)
+                data = network_utils.pack_move(dx * sensitivity, dy * sensitivity)
                 self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
                 
                 # Snap mouse back to center to allow infinite movement
