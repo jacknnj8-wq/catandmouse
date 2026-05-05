@@ -69,13 +69,17 @@ class ClientController:
                 packet_type = struct.unpack('!B', data[:1])[0]
                 if packet_type == 1:
                     import ctypes
-                    dx, dy = network_utils.unpack_move(data)
+                    px, py = network_utils.unpack_move(data)
                     
-                    # Debug print to verify network is working
-                    print(f"[UDP] Move Received: dx={dx:.2f}, dy={dy:.2f}")
+                    # Map percentage (0.0 - 1.0) to local screen resolution
+                    user32 = ctypes.windll.user32
+                    sw = user32.GetSystemMetrics(0)
+                    sh = user32.GetSystemMetrics(1)
                     
-                    # MOUSEEVENTF_MOVE = 0x0001
-                    ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)
+                    target_x = int(px * sw)
+                    target_y = int(py * sh)
+                    
+                    user32.SetCursorPos(target_x, target_y)
             except Exception as e:
                 print(f"[UDP] Error: {e}")
 

@@ -213,27 +213,20 @@ class HostController:
                 print(f"[Control] Failed to send to {ip}: {e}")
 
     def on_move(self, x, y):
-        if self.is_ignoring_move:
-            self.is_ignoring_move = False
-            return
-
         if self.active_client_ip:
-            # Use a fixed center point to calculate relative movement
-            center_x, center_y = 500, 500
-            dx = x - center_x
-            dy = y - center_y
-
-            if dx != 0 or dy != 0:
-                # Sensitivity adjustment (1.0 = normal)
-                sensitivity = 1.0
-                
-                # Send movement to client
-                data = network_utils.pack_move(dx * sensitivity, dy * sensitivity)
-                self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
-                
-                # Snap mouse back to center to allow infinite movement
-                self.is_ignoring_move = True
-                self.mouse_controller.position = (center_x, center_y)
+            import ctypes
+            user32 = ctypes.windll.user32
+            # Get screen size to calculate percentage
+            sw = user32.GetSystemMetrics(0)
+            sh = user32.GetSystemMetrics(1)
+            
+            # Map Host position to 0.0 - 1.0 range
+            px = x / sw
+            py = y / sh
+            
+            # Send as "movement" packet (reusing the format)
+            data = network_utils.pack_move(px, py)
+            self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
         else:
             self.last_pos = (x, y)
 
