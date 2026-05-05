@@ -11,7 +11,9 @@ class HostController:
         self.camera_source = camera_source
         self.active_client_ip = None
         self.gaze_states = {"host": False} # ip -> bool
-        self.is_ignoring_move = False
+        
+        self.mouse_listener = None
+        self.frozen_pos = None
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -47,6 +49,32 @@ class HostController:
         # Calibration state
         self.is_calibrating = False
 
+    def start_listener(self, suppress):
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+            
+        self.mouse_listener = mouse.Listener(
+            on_move=self.on_move,
+            on_click=self.on_click,
+            on_scroll=self.on_scroll,
+            suppress=suppress
+        )
+        self.mouse_listener.start()
+
+    def switch_focus(self, target_ip):
+        if self.active_client_ip == target_ip:
+            return
+            
+        self.active_client_ip = target_ip
+        
+        if target_ip:
+            print(f"[*] Switching to CLIENT mode (Mouse Frozen)")
+            self.frozen_pos = self.mouse_controller.position
+            self.start_listener(suppress=True)
+        else:
+            print("[*] Switching to HOST mode (Mouse Normal)")
+            self.start_listener(suppress=False)
+
     def start(self):
         print(f"Starting Host Server (Camera: {self.camera_source})...")
         threading.Thread(target=self.accept_tcp_clients, daemon=True).start()
@@ -55,36 +83,26 @@ class HostController:
         # Start Vision processing in a separate thread
         threading.Thread(target=self.run_vision, daemon=True).start()
         
-        # Start Mouse Listener
         from pynput import keyboard
-        
         def on_press(key):
             try:
                 if key == keyboard.Key.tab:
-                    # Toggle focus manually for testing
                     if self.active_client_ip:
-                        print("[Manual] Switching focus back to HOST")
-                        self.active_client_ip = None
+                        self.switch_focus(None)
                     elif self.client_tcp_sockets:
                         first_client = list(self.client_tcp_sockets.keys())[0]
-                        print(f"[Manual] Force switching focus to CLIENT: {first_client}")
-                        self.is_ignoring_move = True
-                        self.mouse_controller.position = (500, 500)
-                        self.active_client_ip = first_client
-                    else:
-                        print("[Manual] No clients connected to switch to!")
-            except AttributeError:
-                pass
-
-        # Start keyboard listener in background
+                        self.switch_focus(first_client)
+            except AttributeError: pass
+            
         k_listener = keyboard.Listener(on_press=on_press)
         k_listener.start()
-
-        with mouse.Listener(
-                on_move=self.on_move,
-                on_click=self.on_click,
-                on_scroll=self.on_scroll) as listener:
-            listener.join()
+        
+        # Start in Host Mode initially
+        self.switch_focus(None)
+        
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
 
     def accept_tcp_clients(self):
         while True:
@@ -213,51 +231,37 @@ class HostController:
                 print(f"[Control] Failed to send to {ip}: {e}")
 
     def on_move(self, x, y):
-        if self.active_client_ip:
-            import ctypes
-            user32 = ctypes.windll.user32
-            # Get screen size to calculate percentage
-            sw = user32.GetSystemMetrics(0)
-            sh = user32.GetSystemMetrics(1)
+        if self.active_client_ip and self.frozen_pos:
+            # Calculate raw delta from the frozen position
+            dx = x - self.frozen_pos[0]
+            dy = y - self.frozen_pos[1]
             
-            # Map Host position to 0.0 - 1.0 range
-            px = x / sw
-            py = y / sh
-            
-            # Send as "movement" packet (reusing the format)
-            data = network_utils.pack_move(px, py)
-            self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
-        else:
-            self.last_pos = (x, y)
+            if dx != 0 or dy != 0:
+                # Add sensitivity here (e.g. 1.5)
+                sensitivity = 1.5
+                data = network_utils.pack_move(dx * sensitivity, dy * sensitivity)
+                self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
 
     def on_click(self, x, y, button, pressed):
         if self.active_client_ip:
-            if button == mouse.Button.left:
-                b_id = 1
-            elif button == mouse.Button.right:
-                b_id = 2
-            elif button == mouse.Button.middle:
-                b_id = 3
-            else:
-                return
+            if button == mouse.Button.left: b_id = 1
+            elif button == mouse.Button.right: b_id = 2
+            elif button == mouse.Button.middle: b_id = 3
+            else: return
             
             data = network_utils.pack_click(b_id, pressed)
             sock = self.client_tcp_sockets.get(self.active_client_ip)
             if sock:
-                try:
-                    sock.sendall(data)
-                except Exception as e:
-                    print(f"Error sending click: {e}")
+                try: sock.sendall(data)
+                except Exception as e: print(f"Error: {e}")
 
     def on_scroll(self, x, y, dx, dy):
         if self.active_client_ip:
             data = network_utils.pack_scroll(dx, dy)
             sock = self.client_tcp_sockets.get(self.active_client_ip)
             if sock:
-                try:
-                    sock.sendall(data)
-                except Exception as e:
-                    print(f"Error sending scroll: {e}")
+                try: sock.sendall(data)
+                except Exception as e: print(f"Error: {e}")
 
 if __name__ == "__main__":
     import sys
