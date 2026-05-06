@@ -66,6 +66,81 @@ class ClientController:
         # Start Vision processing in main thread
         self.run_vision()
 
+    def _recv_exact(self, sock, n):
+        """Read exactly n bytes from sock, blocking until all arrive.
+        Returns bytes or raises ConnectionError if socket closes early.
+        """
+        buf = b''
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Socket closed mid-packet")
+            buf += chunk
+        return buf
+
+    def _send_click(self, button_id, pressed):
+        """Inject a click via SendInput so it goes through the same Win32
+        pathway as SetCursorPos (avoids pynput/SendInput level mismatch)."""
+        INPUT_MOUSE = 0
+        MOUSEEVENTF_LEFTDOWN   = 0x0002
+        MOUSEEVENTF_LEFTUP     = 0x0004
+        MOUSEEVENTF_RIGHTDOWN  = 0x0008
+        MOUSEEVENTF_RIGHTUP    = 0x0010
+        MOUSEEVENTF_MIDDLEDOWN = 0x0020
+        MOUSEEVENTF_MIDDLEUP   = 0x0040
+
+        if button_id == 1:
+            flag = MOUSEEVENTF_LEFTDOWN if pressed else MOUSEEVENTF_LEFTUP
+        elif button_id == 2:
+            flag = MOUSEEVENTF_RIGHTDOWN if pressed else MOUSEEVENTF_RIGHTUP
+        else:
+            flag = MOUSEEVENTF_MIDDLEDOWN if pressed else MOUSEEVENTF_MIDDLEUP
+
+        # MOUSEINPUT structure: dx, dy, mouseData, dwFlags, time, dwExtraInfo
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [('dx', ctypes.c_long), ('dy', ctypes.c_long),
+                        ('mouseData', ctypes.c_ulong), ('dwFlags', ctypes.c_ulong),
+                        ('time', ctypes.c_ulong), ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong))]
+
+        class INPUT(ctypes.Structure):
+            class _INPUT(ctypes.Union):
+                _fields_ = [('mi', MOUSEINPUT)]
+            _anonymous_ = ('_input',)
+            _fields_ = [('type', ctypes.c_ulong), ('_input', _INPUT)]
+
+        inp = INPUT(type=INPUT_MOUSE)
+        inp.mi.dwFlags = flag
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    def _send_scroll(self, dx, dy):
+        """Inject a scroll wheel event via SendInput."""
+        MOUSEEVENTF_WHEEL  = 0x0800
+        MOUSEEVENTF_HWHEEL = 0x01000
+        WHEEL_DELTA = 120
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [('dx', ctypes.c_long), ('dy', ctypes.c_long),
+                        ('mouseData', ctypes.c_ulong), ('dwFlags', ctypes.c_ulong),
+                        ('time', ctypes.c_ulong), ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong))]
+
+        class INPUT(ctypes.Structure):
+            class _INPUT(ctypes.Union):
+                _fields_ = [('mi', MOUSEINPUT)]
+            _anonymous_ = ('_input',)
+            _fields_ = [('type', ctypes.c_ulong), ('_input', _INPUT)]
+
+        if dy != 0:
+            inp = INPUT(type=0)
+            inp.mi.dwFlags = MOUSEEVENTF_WHEEL
+            inp.mi.mouseData = ctypes.c_ulong(int(dy * WHEEL_DELTA))
+            ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+        if dx != 0:
+            inp = INPUT(type=0)
+            inp.mi.dwFlags = MOUSEEVENTF_HWHEEL
+            inp.mi.mouseData = ctypes.c_ulong(int(dx * WHEEL_DELTA))
+            ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
     def listen_udp(self):
         print("[UDP] Listening for mouse movement...")
         user32 = ctypes.windll.user32
@@ -96,37 +171,38 @@ class ClientController:
 
     def listen_tcp(self):
         print("[TCP] Listening for clicks/scrolls...")
+        # Packet sizes by type byte:
+        #   type 2 (click):   3 bytes total
+        #   type 3 (scroll):  9 bytes total
+        #   type 4 (control): 2 bytes total
+        TOTAL_SIZE = {2: 3, 3: 9, 4: 2}
+
         while True:
             try:
-                # We expect small packets, max 9 bytes for scroll
-                data = self.tcp_sock.recv(9)
-                if not data:
-                    break
-                
-                packet_type = struct.unpack('!B', data[:1])[0]
-                
+                # Read the type byte first (always 1 byte)
+                type_byte = self._recv_exact(self.tcp_sock, 1)
+                packet_type = struct.unpack('!B', type_byte)[0]
+
+                remaining = TOTAL_SIZE.get(packet_type, 0) - 1
+                rest = self._recv_exact(self.tcp_sock, remaining) if remaining > 0 else b''
+                data = type_byte + rest
+
                 if packet_type == 2:
-                    button_id, pressed = network_utils.unpack_click(data[:3])
-                    
-                    if button_id == 1:
-                        btn = mouse.Button.left
-                    elif button_id == 2:
-                        btn = mouse.Button.right
-                    else:
-                        btn = mouse.Button.middle
-                        
-                    if pressed:
-                        self.mouse_controller.press(btn)
-                    else:
-                        self.mouse_controller.release(btn)
+                    button_id, pressed = network_utils.unpack_click(data)
+                    self._send_click(button_id, pressed)
                 elif packet_type == 3:
-                    dx, dy = network_utils.unpack_scroll(data[:9])
-                    self.mouse_controller.scroll(dx, dy)
+                    dx, dy = network_utils.unpack_scroll(data)
+                    self._send_scroll(dx, dy)
                 elif packet_type == 4:
-                    cmd_id = network_utils.unpack_control(data[:2])
+                    cmd_id = network_utils.unpack_control(data)
                     if cmd_id == 1:
                         print("[Control] Received calibration command from Host")
                         self.should_calibrate = True
+                else:
+                    print(f"[TCP] Unknown packet type: {packet_type}, skipping")
+            except ConnectionError as e:
+                print(f"[TCP] Connection closed: {e}")
+                break
             except Exception as e:
                 print(f"[TCP] Error: {e}")
                 break

@@ -24,6 +24,7 @@ class HostController:
         self.frozen_pos = None
         self.vx = 0.5
         self.vy = 0.5
+        self._snapping = False  # guard: True while we're doing SetCursorPos snap-back
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -274,6 +275,10 @@ class HostController:
 
     def on_move(self, x, y):
         if self.active_client_ip:
+            # Ignore the on_move that our own SetCursorPos snap-back triggers
+            if self._snapping:
+                return
+
             user32 = ctypes.windll.user32
             sw = user32.GetSystemMetrics(0)
             sh = user32.GetSystemMetrics(1)
@@ -297,9 +302,10 @@ class HostController:
                 data = network_utils.pack_move(self.vx, self.vy)
                 self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
 
-                # Park cursor back to centre so next delta is always relative to centre.
-                # Because the listener is in suppress=True mode the snap-back is invisible.
+                # Park cursor back to centre. Guard flag prevents this from re-triggering on_move.
+                self._snapping = True
                 user32.SetCursorPos(cx, cy)
+                self._snapping = False
 
     def on_scroll(self, x, y, dx, dy):
         if self.active_client_ip:
