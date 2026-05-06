@@ -21,10 +21,9 @@ class HostController:
         self.gaze_states = {"host": False} # ip -> bool
         
         self.mouse_listener = None
-        self.frozen_pos = None
         self.vx = 0.5
         self.vy = 0.5
-        self._snapping = False  # guard: True while we're doing SetCursorPos snap-back
+        self.sensitivity = 1.5
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -61,19 +60,70 @@ class HostController:
         self.is_calibrating = False
 
     def _win32_filter_client_mode(self, msg, data):
-        """Used when CLIENT is active: intercept clicks and forward them; suppress ALL input."""
-        if msg == 0x0201: self.send_manual_click(1, True)
+        """In CLIENT mode: handle EVERYTHING here.
+        Key insight: with suppress=True, Windows does NOT advance its internal cursor
+        position after a suppressed event. So computing dx from data.pt drifts over time.
+        Fix: snap cursor back to screen-center after every real event so Windows always
+        starts the NEXT delta from center. Skip the resulting injected event via LLMHF_INJECTED.
+        """
+        LLMHF_INJECTED = 0x01
+
+        if msg == 0x0200:  # WM_MOUSEMOVE
+            # Skip events we injected ourselves (snap-back)
+            if data.flags & LLMHF_INJECTED:
+                return False
+
+            user32 = ctypes.windll.user32
+            sw = user32.GetSystemMetrics(0)
+            sh = user32.GetSystemMetrics(1)
+            cx, cy = sw // 2, sh // 2
+
+            # Delta is always relative to center because we snap back there after each event
+            dx = data.pt.x - cx
+            dy = data.pt.y - cy
+
+            if (dx != 0 or dy != 0) and self.active_client_ip:
+                self.vx = max(0.0, min(1.0, self.vx + (dx / sw) * self.sensitivity))
+                self.vy = max(0.0, min(1.0, self.vy + (dy / sh) * self.sensitivity))
+                try:
+                    pkt = network_utils.pack_move(self.vx, self.vy)
+                    self.udp_sock.sendto(pkt, (self.active_client_ip, network_utils.UDP_PORT))
+                except Exception:
+                    pass
+
+            # Snap back to center — keeps Windows cursor state consistent for next delta.
+            # This fires an injected WM_MOUSEMOVE caught by the LLMHF_INJECTED check above.
+            user32.SetCursorPos(cx, cy)
+
+        elif msg == 0x0201: self.send_manual_click(1, True)
         elif msg == 0x0202: self.send_manual_click(1, False)
         elif msg == 0x0204: self.send_manual_click(2, True)
         elif msg == 0x0205: self.send_manual_click(2, False)
         elif msg == 0x0207: self.send_manual_click(3, True)
         elif msg == 0x0208: self.send_manual_click(3, False)
-        # Always return False in client mode: suppress ALL mouse input on the host
-        return False
+
+        elif msg == 0x020A:  # WM_MOUSEWHEEL (vertical)
+            delta = ctypes.c_short(data.mouseData >> 16).value / 120
+            self._send_scroll_to_client(0, delta)
+        elif msg == 0x020E:  # WM_MOUSEHWHEEL (horizontal)
+            delta = ctypes.c_short(data.mouseData >> 16).value / 120
+            self._send_scroll_to_client(delta, 0)
+
+        return False  # Suppress ALL host input
 
     def _win32_filter_host_mode(self, msg, data):
-        """Used when HOST is active: pass everything through normally."""
+        """HOST mode: pass everything through normally."""
         return True
+
+    def _send_scroll_to_client(self, dx, dy):
+        if not self.active_client_ip:
+            return
+        sock = self.client_tcp_sockets.get(self.active_client_ip)
+        if sock:
+            try:
+                sock.sendall(network_utils.pack_scroll(dx, dy))
+            except Exception as e:
+                print(f"[Scroll] Error: {e}")
 
     def send_manual_click(self, button_id, pressed):
         if self.active_client_ip:
@@ -84,17 +134,16 @@ class HostController:
                 except Exception as e: print(f"Error: {e}")
 
     def _restart_listener(self, suppress):
-        """Stop the current mouse listener and restart with the given suppress flag.
-        suppress=True  -> host cursor is fully frozen, all input blocked
-        suppress=False -> host cursor moves normally
+        """Restart the mouse listener with the appropriate suppress mode.
+        In client mode (suppress=True): filter handles everything, no callbacks needed.
+        In host mode (suppress=False): normal OS passthrough.
         """
         if self.mouse_listener and self.mouse_listener.running:
             self.mouse_listener.stop()
+            self.mouse_listener.join(timeout=0.5)  # wait for clean stop
 
         win32_filter = self._win32_filter_client_mode if suppress else self._win32_filter_host_mode
         self.mouse_listener = mouse.Listener(
-            on_move=self.on_move,
-            on_scroll=self.on_scroll,
             suppress=suppress,
             win32_event_filter=win32_filter
         )
@@ -108,10 +157,12 @@ class HostController:
 
         if target_ip:
             print(f"[*] Switching to CLIENT mode — host input fully suppressed")
+            # Park cursor at center so the first real delta is computed from center
             user32 = ctypes.windll.user32
-            cx, cy = user32.GetSystemMetrics(0) // 2, user32.GetSystemMetrics(1) // 2
-            user32.SetCursorPos(cx, cy)   # park cursor at screen centre
-            self.vx, self.vy = 0.5, 0.5  # reset virtual cursor to centre
+            cx = user32.GetSystemMetrics(0) // 2
+            cy = user32.GetSystemMetrics(1) // 2
+            user32.SetCursorPos(cx, cy)
+            self.vx, self.vy = 0.5, 0.5
             self._restart_listener(suppress=True)
         else:
             print("[*] Switching to HOST mode — host input restored")
@@ -273,55 +324,12 @@ class HostController:
             except Exception as e:
                 print(f"[Control] Failed to send to {ip}: {e}")
 
-    def on_move(self, x, y):
-        if self.active_client_ip:
-            # Ignore the on_move that our own SetCursorPos snap-back triggers
-            if self._snapping:
-                return
-
-            user32 = ctypes.windll.user32
-            sw = user32.GetSystemMetrics(0)
-            sh = user32.GetSystemMetrics(1)
-            cx, cy = sw // 2, sh // 2
-
-            # Calculate physical delta from where we parked the cursor (centre)
-            dx = x - cx
-            dy = y - cy
-
-            if dx != 0 or dy != 0:
-                # Accumulate into the virtual 0.0–1.0 cursor position
-                sensitivity = 1.5  # tweak this for feel; >1 = faster relative movement
-                self.vx += (dx / sw) * sensitivity
-                self.vy += (dy / sh) * sensitivity
-
-                # Clamp so the remote cursor never flies off-screen
-                self.vx = max(0.0, min(1.0, self.vx))
-                self.vy = max(0.0, min(1.0, self.vy))
-
-                # Send absolute normalised position to client
-                data = network_utils.pack_move(self.vx, self.vy)
-                self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
-
-                # Park cursor back to centre. Guard flag prevents this from re-triggering on_move.
-                self._snapping = True
-                user32.SetCursorPos(cx, cy)
-                self._snapping = False
-
-    def on_scroll(self, x, y, dx, dy):
-        if self.active_client_ip:
-            data = network_utils.pack_scroll(dx, dy)
-            sock = self.client_tcp_sockets.get(self.active_client_ip)
-            if sock:
-                try: sock.sendall(data)
-                except Exception as e: print(f"Error: {e}")
-
 if __name__ == "__main__":
     import sys
-    
-    # Default to 0 (built-in webcam) for host
+
     camera_source = 0
     if len(sys.argv) > 1:
         camera_source = sys.argv[1]
-    
+
     host = HostController(camera_source)
     host.start()
