@@ -3,9 +3,17 @@ import threading
 import time
 import cv2
 import struct
+import ctypes
 from pynput import mouse
 import network_utils
 from gaze_tracker import GazeTracker
+
+# Make all coordinate operations consistent with physical pixels,
+# regardless of Windows DPI scaling (100%, 125%, 150%, etc.)
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 class ClientController:
     def __init__(self, host_ip, camera_source=0):
@@ -60,25 +68,28 @@ class ClientController:
 
     def listen_udp(self):
         print("[UDP] Listening for mouse movement...")
+        user32 = ctypes.windll.user32
         while True:
             try:
                 data, addr = self.udp_sock.recvfrom(1024)
                 if not data:
                     continue
-                # The first byte is the packet type
                 packet_type = struct.unpack('!B', data[:1])[0]
                 if packet_type == 1:
-                    import ctypes
                     px, py = network_utils.unpack_move(data)
-                    
-                    # Map percentage (0.0 - 1.0) to local screen resolution
-                    user32 = ctypes.windll.user32
+
+                    # Use GetSystemMetrics in physical-pixel mode (guaranteed by
+                    # SetProcessDPIAware above) to map the 0–1 fraction to screen coords.
                     sw = user32.GetSystemMetrics(0)
                     sh = user32.GetSystemMetrics(1)
-                    
-                    target_x = int(px * sw)
-                    target_y = int(py * sh)
-                    
+
+                    # Clamp to valid range before converting
+                    px = max(0.0, min(1.0, px))
+                    py = max(0.0, min(1.0, py))
+
+                    target_x = int(px * (sw - 1))
+                    target_y = int(py * (sh - 1))
+
                     user32.SetCursorPos(target_x, target_y)
             except Exception as e:
                 print(f"[UDP] Error: {e}")
