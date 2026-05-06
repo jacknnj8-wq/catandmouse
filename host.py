@@ -51,17 +51,26 @@ class HostController:
         # Calibration state
         self.is_calibrating = False
 
-    def start_listener(self, suppress):
-        if self.mouse_listener:
-            self.mouse_listener.stop()
-            
-        self.mouse_listener = mouse.Listener(
-            on_move=self.on_move,
-            on_click=self.on_click,
-            on_scroll=self.on_scroll,
-            suppress=suppress
-        )
-        self.mouse_listener.start()
+    def win32_event_filter(self, msg, data):
+        if self.active_client_ip:
+            # 0x0201: LDOWN, 0x0202: LUP
+            # 0x0204: RDOWN, 0x0205: RUP
+            # 0x0207: MDOWN, 0x0208: MUP
+            if msg == 0x0201: self.send_manual_click(1, True); return False
+            elif msg == 0x0202: self.send_manual_click(1, False); return False
+            elif msg == 0x0204: self.send_manual_click(2, True); return False
+            elif msg == 0x0205: self.send_manual_click(2, False); return False
+            elif msg == 0x0207: self.send_manual_click(3, True); return False
+            elif msg == 0x0208: self.send_manual_click(3, False); return False
+        return True
+
+    def send_manual_click(self, button_id, pressed):
+        if self.active_client_ip:
+            data = network_utils.pack_click(button_id, pressed)
+            sock = self.client_tcp_sockets.get(self.active_client_ip)
+            if sock:
+                try: sock.sendall(data)
+                except Exception as e: print(f"Error: {e}")
 
     def switch_focus(self, target_ip):
         if self.active_client_ip == target_ip:
@@ -72,22 +81,12 @@ class HostController:
         if target_ip:
             print(f"[*] Switching to CLIENT mode (Mouse Frozen)")
             import ctypes
-            import time
             user32 = ctypes.windll.user32
             cx, cy = user32.GetSystemMetrics(0) // 2, user32.GetSystemMetrics(1) // 2
-            
-            # Move cursor to center so it doesn't hit physical screen edges
-            user32.SetCursorPos(cx, cy)
-            time.sleep(0.05) # Wait for OS to apply
-            
-            # Read exact physical position to prevent huge coordinate mismatches
-            self.frozen_pos = self.mouse_controller.position
-            
+            user32.SetCursorPos(cx, cy) # Center cursor
             self.vx, self.vy = 0.5, 0.5 # Reset virtual cursor
-            self.start_listener(suppress=True)
         else:
             print("[*] Switching to HOST mode (Mouse Normal)")
-            self.start_listener(suppress=False)
 
     def start(self):
         print(f"Starting Host Server (Camera: {self.camera_source})...")
@@ -110,6 +109,14 @@ class HostController:
             
         k_listener = keyboard.Listener(on_press=on_press)
         k_listener.start()
+        
+        # Start Mouse Listener ONCE
+        self.mouse_listener = mouse.Listener(
+            on_move=self.on_move,
+            on_scroll=self.on_scroll,
+            win32_event_filter=self.win32_event_filter
+        )
+        self.mouse_listener.start()
         
         # Start in Host Mode initially
         self.switch_focus(None)
@@ -273,19 +280,6 @@ class HostController:
                 # CRITICAL: Snap cursor back to center so dx is ALWAYS just the physical delta of one movement!
                 # This prevents 'dx' from growing infinitely and launching the mouse into the corner.
                 user32.SetCursorPos(cx, cy)
-
-    def on_click(self, x, y, button, pressed):
-        if self.active_client_ip:
-            if button == mouse.Button.left: b_id = 1
-            elif button == mouse.Button.right: b_id = 2
-            elif button == mouse.Button.middle: b_id = 3
-            else: return
-            
-            data = network_utils.pack_click(b_id, pressed)
-            sock = self.client_tcp_sockets.get(self.active_client_ip)
-            if sock:
-                try: sock.sendall(data)
-                except Exception as e: print(f"Error: {e}")
 
     def on_scroll(self, x, y, dx, dy):
         if self.active_client_ip:
