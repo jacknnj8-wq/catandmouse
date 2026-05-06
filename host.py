@@ -72,9 +72,17 @@ class HostController:
         if target_ip:
             print(f"[*] Switching to CLIENT mode (Mouse Frozen)")
             import ctypes
+            import time
             user32 = ctypes.windll.user32
             cx, cy = user32.GetSystemMetrics(0) // 2, user32.GetSystemMetrics(1) // 2
-            user32.SetCursorPos(cx, cy) # Center before suppressing
+            
+            # Move cursor to center so it doesn't hit physical screen edges
+            user32.SetCursorPos(cx, cy)
+            time.sleep(0.05) # Wait for OS to apply
+            
+            # Read exact physical position to prevent huge coordinate mismatches
+            self.frozen_pos = self.mouse_controller.position
+            
             self.vx, self.vy = 0.5, 0.5 # Reset virtual cursor
             self.start_listener(suppress=True)
         else:
@@ -244,16 +252,17 @@ class HostController:
             sh = user32.GetSystemMetrics(1)
             cx, cy = sw // 2, sh // 2
             
+            # Calculate physical delta from the center
             dx = x - cx
             dy = y - cy
             
             if dx != 0 or dy != 0:
-                # Update Virtual Cursor
-                sensitivity = 1.5
+                # Update Virtual Cursor 
+                sensitivity = 1.0 # 1.0 gives a 1:1 feel across standard screens
                 self.vx += (dx / sw) * sensitivity
                 self.vy += (dy / sh) * sensitivity
                 
-                # Clamp to 0.0 - 1.0
+                # Clamp to 0.0 - 1.0 to prevent going off-screen
                 self.vx = max(0.0, min(1.0, self.vx))
                 self.vy = max(0.0, min(1.0, self.vy))
                 
@@ -261,7 +270,8 @@ class HostController:
                 data = network_utils.pack_move(self.vx, self.vy)
                 self.udp_sock.sendto(data, (self.active_client_ip, network_utils.UDP_PORT))
                 
-                # Reset the internal cursor so it never hits the edge of the screen
+                # CRITICAL: Snap cursor back to center so dx is ALWAYS just the physical delta of one movement!
+                # This prevents 'dx' from growing infinitely and launching the mouse into the corner.
                 user32.SetCursorPos(cx, cy)
 
     def on_click(self, x, y, button, pressed):
