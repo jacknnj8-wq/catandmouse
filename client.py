@@ -238,7 +238,8 @@ class ClientController:
         
         print("Waiting for Host to start calibration (Press 'C' on Host)...")
         
-        last_gaze_state = None
+        last_gaze_conf     = -1.0  # last sent confidence value
+        SEND_THRESHOLD      = 0.03  # only send when confidence changes by this much
         consecutive_failures = 0
         
         while cap.isOpened():
@@ -258,19 +259,19 @@ class ClientController:
             
             consecutive_failures = 0
 
-            annotated_image, is_looking, angles = self.tracker.process_frame(frame)
-            
+            annotated_image, confidence, angles = self.tracker.process_frame(frame)
+
             if not self.tracker.is_calibrated:
-                cv2.putText(annotated_image, "CALIBRATING CLIENT...", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            
-            # Send state if it changed, or periodically
-            if is_looking != last_gaze_state:
+                cv2.putText(annotated_image, "CALIBRATING CLIENT...", (20, 130),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+            # Send confidence to host only when it changes meaningfully
+            if abs(confidence - last_gaze_conf) >= SEND_THRESHOLD:
                 try:
-                    data = network_utils.pack_gaze(is_looking)
-                    self.gaze_sock.sendall(data)
-                    last_gaze_state = is_looking
+                    self.gaze_sock.sendall(network_utils.pack_gaze(confidence))
+                    last_gaze_conf = confidence
                 except Exception as e:
-                    print(f"Failed to send gaze state: {e}")
+                    print(f"Failed to send gaze confidence: {e}")
             
             try:
                 cv2.imshow('Client Gaze Tracker', annotated_image)

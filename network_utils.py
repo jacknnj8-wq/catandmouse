@@ -21,8 +21,8 @@ CLICK_FMT = '!BBB'
 # type 3 = scroll
 SCROLL_FMT = '!Bii'
 
-# Gaze Packet: is_looking(1 byte)
-GAZE_FMT = '!B'
+# Gaze Packet: confidence score (float 0.0-1.0)
+GAZE_FMT = '!f'
 
 # Control Packet: type(1 byte), cmd_id(1 byte)
 # type 4 = control
@@ -50,12 +50,11 @@ def unpack_scroll(data):
     _, dx, dy = struct.unpack(SCROLL_FMT, data)
     return dx, dy
 
-def pack_gaze(is_looking):
-    return struct.pack(GAZE_FMT, 1 if is_looking else 0)
+def pack_gaze(confidence: float) -> bytes:
+    return struct.pack(GAZE_FMT, float(confidence))
 
-def unpack_gaze(data):
-    is_looking = struct.unpack(GAZE_FMT, data)[0]
-    return bool(is_looking)
+def unpack_gaze(data: bytes) -> float:
+    return struct.unpack(GAZE_FMT, data)[0]
 
 def pack_control(cmd_id):
     return struct.pack(CONTROL_FMT, 4, int(cmd_id))

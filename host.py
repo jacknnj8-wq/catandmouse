@@ -18,7 +18,7 @@ class HostController:
     def __init__(self, camera_source=0):
         self.camera_source = camera_source
         self.active_client_ip = None
-        self.gaze_states = {"host": False} # ip -> bool
+        self.gaze_states = {"host": 0.0}  # ip -> float confidence (0.0-1.0)
         
         self.mouse_listener = None
         self.vx = 0.5
@@ -211,51 +211,69 @@ class HostController:
             threading.Thread(target=self.handle_gaze_client, args=(client, addr[0]), daemon=True).start()
 
     def handle_gaze_client(self, client, ip):
+        GAZE_SIZE = 4  # float = 4 bytes
         try:
             while True:
-                data = client.recv(1)
-                if not data:
-                    break
-                is_looking = network_utils.unpack_gaze(data)
-                self.gaze_states[ip] = is_looking
+                data = b''
+                while len(data) < GAZE_SIZE:
+                    chunk = client.recv(GAZE_SIZE - len(data))
+                    if not chunk:
+                        raise ConnectionError("Gaze socket closed")
+                    data += chunk
+                confidence = network_utils.unpack_gaze(data)
+                self.gaze_states[ip] = max(0.0, min(1.0, confidence))
                 self.update_focus()
         except Exception as e:
-            print(f"[Gaze] Error with {ip}: {e}")
+            print(f"[Gaze] Lost connection with {ip}: {e}")
         finally:
             client.close()
-            if ip in self.gaze_states:
-                del self.gaze_states[ip]
+            self.gaze_states.pop(ip, None)
             self.update_focus()
 
     def update_focus(self):
-        # Priority 1: Host
-        if self.gaze_states.get("host"):
-            if self.active_client_ip is not None:
-                print("[*] Focus returned to Host (Local Camera detected focus)")
-                self.active_client_ip = None
+        """Pick the device with the highest gaze confidence, with hysteresis
+        so that brief confidence dips don't flicker the mouse listener.
+
+        Acquire threshold : confidence must exceed ACTIVATE to win focus.
+        Release threshold : current owner keeps focus until it drops below HOLD.
+        """
+        ACTIVATE = 0.40   # must beat this to steal focus
+        HOLD     = 0.20   # current owner releases focus below this
+
+        # Confidence of whoever currently owns focus
+        if self.active_client_ip is None:
+            current_conf = self.gaze_states.get("host", 0.0)
+        else:
+            current_conf = self.gaze_states.get(self.active_client_ip, 0.0)
+
+        # If current owner is still above the hold threshold, keep them
+        if current_conf >= HOLD:
+            # Check if someone else is significantly more confident
+            best_ip   = None
+            best_conf = current_conf + 0.15   # challenger needs a clear lead
+            for ip, conf in self.gaze_states.items():
+                dev_ip = None if ip == "host" else ip
+                if dev_ip == self.active_client_ip:
+                    continue
+                if conf > best_conf:
+                    best_conf = conf
+                    best_ip   = dev_ip
+            if best_ip is not None:
+                print(f"[Focus] Challenger {best_ip or 'host'} wins with {best_conf:.2f}")
+                self.switch_focus(best_ip)
+            # else: keep current owner
             return
 
-        # Priority 2: Clients
-        found_active_client = False
-        for ip, is_looking in self.gaze_states.items():
-            if ip == "host": continue
-            if is_looking:
-                found_active_client = True
-                if self.active_client_ip != ip:
-                    print(f"[*] Focus switched to client {ip}")
-                    self.active_client_ip = ip
-                break
-        
-        if not found_active_client and self.active_client_ip is not None:
-            # If no one is looking at any screen, we can either keep focus or clear it.
-            # Keeping it for now to avoid flickering.
-            pass
-        
-        # If no one is looking, keep current or clear?
-        # Let's clear focus if no one is looking for simplicity
-        # if self.active_client_ip:
-        #    print("[*] No focus detected")
-        #    self.active_client_ip = None
+        # Current owner dropped below HOLD — open election
+        best_ip   = None
+        best_conf = ACTIVATE
+        for ip, conf in self.gaze_states.items():
+            dev_ip = None if ip == "host" else ip
+            if conf > best_conf:
+                best_conf = conf
+                best_ip   = dev_ip
+
+        self.switch_focus(best_ip)
 
     def run_vision(self):
         print(f"[Vision] Initializing camera source: {self.camera_source}...")
@@ -284,15 +302,16 @@ class HostController:
             if not success:
                 continue
 
-            annotated_image, is_looking, angles = tracker.process_frame(frame)
-            self.gaze_states["host"] = is_looking
+            annotated_image, confidence, angles = tracker.process_frame(frame)
+            self.gaze_states["host"] = confidence
             self.update_focus()
             
-            # Display info
-            text = "LOOKING AT HOST" if is_looking else "HOST NOT FOCUSED"
-            color = (0, 255, 0) if is_looking else (0, 0, 255)
-            cv2.putText(annotated_image, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            cv2.putText(annotated_image, "Press 'C' to Calibrate", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+            focused = confidence >= 0.40
+            text  = f"HOST FOCUSED  ({confidence:.2f})" if focused else f"HOST AWAY  ({confidence:.2f})"
+            color = (0, 255, 0) if focused else (0, 0, 255)
+            cv2.putText(annotated_image, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(annotated_image, "Press 'C' to Calibrate", (20, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
 
             if self.is_calibrating:
                 cv2.putText(annotated_image, "CALIBRATING HOST...", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
