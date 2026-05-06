@@ -24,6 +24,7 @@ class HostController:
         self.vx = 0.5
         self.vy = 0.5
         self.sensitivity = 1.5
+        self._gaze_lock = threading.Lock()  # protects gaze_states across threads
         
         # Sockets
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -134,13 +135,10 @@ class HostController:
                 except Exception as e: print(f"Error: {e}")
 
     def _restart_listener(self, suppress):
-        """Restart the mouse listener with the appropriate suppress mode.
-        In client mode (suppress=True): filter handles everything, no callbacks needed.
-        In host mode (suppress=False): normal OS passthrough.
-        """
+        """Restart the mouse listener with the appropriate suppress mode."""
         if self.mouse_listener and self.mouse_listener.running:
             self.mouse_listener.stop()
-            self.mouse_listener.join(timeout=0.5)  # wait for clean stop
+            # No join() — stopping is async but the new listener starts cleanly
 
         win32_filter = self._win32_filter_client_mode if suppress else self._win32_filter_host_mode
         self.mouse_listener = mouse.Listener(
@@ -168,32 +166,79 @@ class HostController:
             print("[*] Switching to HOST mode — host input restored")
             self._restart_listener(suppress=False)
 
+    def focus_arbiter(self):
+        """Dedicated thread — runs every 100 ms and decides which device owns focus.
+
+        Keeps its own hysteresis state so switch_focus() (and its listener restart)
+        is called AT MOST once per 100 ms, not 30+ times per second.
+
+        Acquire : challenger must beat ACTIVATE AND have a 0.15 lead over current owner.
+        Release : current owner only loses focus when it drops below HOLD.
+        """
+        ACTIVATE = 0.40
+        HOLD     = 0.20
+        LEAD     = 0.15   # challenger must exceed owner by this margin
+        INTERVAL = 0.10   # 10 Hz arbitration
+        
+        loop_count = 0
+
+        while True:
+            time.sleep(INTERVAL)
+            loop_count += 1
+
+            with self._gaze_lock:
+                states = dict(self.gaze_states)  # snapshot
+
+            if loop_count % 10 == 0:
+                print(f"[Arbiter] Current states: {states} | Active: {self.active_client_ip or 'host'}")
+
+            # Current owner's confidence
+            if self.active_client_ip is None:
+                owner_conf = states.get("host", 0.0)
+            else:
+                owner_conf = states.get(self.active_client_ip, 0.0)
+
+            if owner_conf >= HOLD:
+                # Owner is comfortable — only switch if a challenger has a clear lead
+                best_ip   = self.active_client_ip
+                best_conf = owner_conf + LEAD
+                for ip, conf in states.items():
+                    dev_ip = None if ip == "host" else ip
+                    if dev_ip == self.active_client_ip:
+                        continue
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_ip   = dev_ip
+                if best_ip != self.active_client_ip:
+                    print(f"[Focus] Challenger {best_ip or 'host'} overpowers with {best_conf:.2f} > {owner_conf:.2f}")
+                self.switch_focus(best_ip)  # guard inside switch_focus prevents no-op restarts
+            else:
+                # Owner dropped below HOLD — open election
+                # Default to keeping the current owner if no one hits the ACTIVATE threshold
+                best_ip   = self.active_client_ip
+                best_conf = ACTIVATE
+                for ip, conf in states.items():
+                    dev_ip = None if ip == "host" else ip
+                    if conf >= best_conf:
+                        best_conf = conf
+                        best_ip   = dev_ip
+                
+                if best_ip != self.active_client_ip and best_conf >= ACTIVATE:
+                    print(f"[Focus] Open election won by {best_ip or 'host'} with {best_conf:.2f}")
+                
+                self.switch_focus(best_ip)
+
     def start(self):
         print(f"Starting Host Server (Camera: {self.camera_source})...")
         threading.Thread(target=self.accept_tcp_clients, daemon=True).start()
         threading.Thread(target=self.accept_gaze_clients, daemon=True).start()
-        
-        # Start Vision processing in a separate thread
-        threading.Thread(target=self.run_vision, daemon=True).start()
-        
-        from pynput import keyboard
-        def on_press(key):
-            try:
-                if key == keyboard.Key.tab:
-                    if self.active_client_ip:
-                        self.switch_focus(None)
-                    elif self.client_tcp_sockets:
-                        first_client = list(self.client_tcp_sockets.keys())[0]
-                        self.switch_focus(first_client)
-            except AttributeError: pass
-            
-        k_listener = keyboard.Listener(on_press=on_press)
-        k_listener.start()
-        
-        # Start in Host Mode (suppress=False, normal mouse)
-        # switch_focus() will call _restart_listener() for us
+        threading.Thread(target=self.run_vision,      daemon=True).start()
+        threading.Thread(target=self.focus_arbiter,   daemon=True).start()
+
+        # Start in Host Mode — listener in normal (suppress=False) state
         self.switch_focus(None)
-        
+
+        print("[Host] Gaze-based focus switching active. Press ESC in camera window to quit.")
         # Keep main thread alive
         while True:
             time.sleep(1)
@@ -221,59 +266,16 @@ class HostController:
                         raise ConnectionError("Gaze socket closed")
                     data += chunk
                 confidence = network_utils.unpack_gaze(data)
-                self.gaze_states[ip] = max(0.0, min(1.0, confidence))
-                self.update_focus()
+                with self._gaze_lock:
+                    self.gaze_states[ip] = max(0.0, min(1.0, confidence))
+                # NOTE: focus_arbiter handles all switching at 10 Hz.
         except Exception as e:
             print(f"[Gaze] Lost connection with {ip}: {e}")
         finally:
             client.close()
-            self.gaze_states.pop(ip, None)
-            self.update_focus()
+            with self._gaze_lock:
+                self.gaze_states.pop(ip, None)
 
-    def update_focus(self):
-        """Pick the device with the highest gaze confidence, with hysteresis
-        so that brief confidence dips don't flicker the mouse listener.
-
-        Acquire threshold : confidence must exceed ACTIVATE to win focus.
-        Release threshold : current owner keeps focus until it drops below HOLD.
-        """
-        ACTIVATE = 0.40   # must beat this to steal focus
-        HOLD     = 0.20   # current owner releases focus below this
-
-        # Confidence of whoever currently owns focus
-        if self.active_client_ip is None:
-            current_conf = self.gaze_states.get("host", 0.0)
-        else:
-            current_conf = self.gaze_states.get(self.active_client_ip, 0.0)
-
-        # If current owner is still above the hold threshold, keep them
-        if current_conf >= HOLD:
-            # Check if someone else is significantly more confident
-            best_ip   = None
-            best_conf = current_conf + 0.15   # challenger needs a clear lead
-            for ip, conf in self.gaze_states.items():
-                dev_ip = None if ip == "host" else ip
-                if dev_ip == self.active_client_ip:
-                    continue
-                if conf > best_conf:
-                    best_conf = conf
-                    best_ip   = dev_ip
-            if best_ip is not None:
-                print(f"[Focus] Challenger {best_ip or 'host'} wins with {best_conf:.2f}")
-                self.switch_focus(best_ip)
-            # else: keep current owner
-            return
-
-        # Current owner dropped below HOLD — open election
-        best_ip   = None
-        best_conf = ACTIVATE
-        for ip, conf in self.gaze_states.items():
-            dev_ip = None if ip == "host" else ip
-            if conf > best_conf:
-                best_conf = conf
-                best_ip   = dev_ip
-
-        self.switch_focus(best_ip)
 
     def run_vision(self):
         print(f"[Vision] Initializing camera source: {self.camera_source}...")
@@ -303,9 +305,10 @@ class HostController:
                 continue
 
             annotated_image, confidence, angles = tracker.process_frame(frame)
-            self.gaze_states["host"] = confidence
-            self.update_focus()
-            
+            with self._gaze_lock:
+                self.gaze_states["host"] = confidence
+            # NOTE: do NOT call update_focus here — focus_arbiter does it at 10 Hz.
+
             focused = confidence >= 0.40
             text  = f"HOST FOCUSED  ({confidence:.2f})" if focused else f"HOST AWAY  ({confidence:.2f})"
             color = (0, 255, 0) if focused else (0, 0, 255)
