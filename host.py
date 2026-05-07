@@ -167,19 +167,13 @@ class HostController:
             self._restart_listener(suppress=False)
 
     def focus_arbiter(self):
-        """Dedicated thread — runs every 100 ms and decides which device owns focus.
-
-        Keeps its own hysteresis state so switch_focus() (and its listener restart)
-        is called AT MOST once per 100 ms, not 30+ times per second.
-
-        Acquire : challenger must beat ACTIVATE AND have a 0.15 lead over current owner.
-        Release : current owner only loses focus when it drops below HOLD.
         """
-        ACTIVATE = 0.40
-        HOLD     = 0.20
-        LEAD     = 0.15   # challenger must exceed owner by this margin
-        INTERVAL = 0.10   # 10 Hz arbitration
-        
+        Runs every 100 ms.  Rule: whichever device has the highest confidence
+        score claims the mouse, as long as it beats the current owner by at
+        least MARGIN (hysteresis so we don't flip-flop on noise).
+        """
+        MARGIN   = 0.06   # challenger must beat owner by this much to take over
+        INTERVAL = 0.10   # 10 Hz
         loop_count = 0
 
         while True:
@@ -187,46 +181,28 @@ class HostController:
             loop_count += 1
 
             with self._gaze_lock:
-                states = dict(self.gaze_states)  # snapshot
+                states = dict(self.gaze_states)
 
             if loop_count % 10 == 0:
-                print(f"[Arbiter] Current states: {states} | Active: {self.active_client_ip or 'host'}")
+                print(f"[Arbiter] {states} | owner={self.active_client_ip or 'host'}")
 
             # Current owner's confidence
-            if self.active_client_ip is None:
-                owner_conf = states.get("host", 0.0)
-            else:
-                owner_conf = states.get(self.active_client_ip, 0.0)
+            owner_key  = "host" if self.active_client_ip is None else self.active_client_ip
+            owner_conf = states.get(owner_key, 0.0)
 
-            if owner_conf >= HOLD:
-                # Owner is comfortable — only switch if a challenger has a clear lead
-                best_ip   = self.active_client_ip
-                best_conf = owner_conf + LEAD
-                for ip, conf in states.items():
-                    dev_ip = None if ip == "host" else ip
-                    if dev_ip == self.active_client_ip:
-                        continue
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_ip   = dev_ip
-                if best_ip != self.active_client_ip:
-                    print(f"[Focus] Challenger {best_ip or 'host'} overpowers with {best_conf:.2f} > {owner_conf:.2f}")
-                self.switch_focus(best_ip)  # guard inside switch_focus prevents no-op restarts
-            else:
-                # Owner dropped below HOLD — open election
-                # Default to keeping the current owner if no one hits the ACTIVATE threshold
-                best_ip   = self.active_client_ip
-                best_conf = ACTIVATE
-                for ip, conf in states.items():
-                    dev_ip = None if ip == "host" else ip
-                    if conf >= best_conf:
-                        best_conf = conf
-                        best_ip   = dev_ip
-                
-                if best_ip != self.active_client_ip and best_conf >= ACTIVATE:
-                    print(f"[Focus] Open election won by {best_ip or 'host'} with {best_conf:.2f}")
-                
-                self.switch_focus(best_ip)
+            # Find the device with the highest confidence (excluding current owner)
+            best_ip   = self.active_client_ip   # default: keep owner
+            best_conf = owner_conf + MARGIN      # challenger must exceed this
+
+            for ip, conf in states.items():
+                dev_ip = None if ip == "host" else ip
+                if dev_ip == self.active_client_ip:
+                    continue
+                if conf > best_conf:
+                    best_conf = conf
+                    best_ip   = dev_ip
+
+            self.switch_focus(best_ip)
 
     def start(self):
         print(f"Starting Host Server (Camera: {self.camera_source})...")
